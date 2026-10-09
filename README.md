@@ -2,23 +2,25 @@
 
 This repository accompanies the AAMAD paper. This page presents the role prompts supplied with the experimental implementation. 
 
-## Prompt index
+## Prompt Index
 
-1. [DOIExpert](#1-doiexpert-dataset-repository-doi-expert)
-2. [AccessionExpert](#2-accessionexpert-database-accession-expert)
-3. [MetadataExpert](#3-metadataexpert-metadata-reverse-lookup-expert)
-4. [Prosecutor](#4-prosecutor-adversarial-debate--opposing-role)
-5. [Defender](#5-defender-adversarial-debate--supporting-role)
-6. [Judge](#6-judge-final-decision-role)
+1. [DOIExpert](#1-doiexpert)
+2. [AccessionExpert](#2-accessionexpert)
+3. [MetadataExpert](#3-metadataexpert)
+4. [Prosecutor](#4-prosecutor)
+5. [Defender](#5-defender)
+6. [Judge](#6-judge)
 
-## 1. DOIExpert (Dataset Repository DOI Expert)
+## 1. DOIExpert
+
+*Dataset Repository DOI Expert*
 
 **Role:** Identify dataset repository DOIs (Dryad, Zenodo, figshare, PANGAEA, etc.)  
 **Strategy:** Extract candidates directly from dataset_native repositories using repository rules; send mixed/supplementary candidates to the LLM for verification.  
 **Output:** `{"mentions":[{"dataset_doi":"","evidence":"","confidence":0.0}]}`
 
-<details>
-<summary><strong>DOIExpert Prompt Template</strong></summary>
+### DOIExpert Prompt Template
+
 ```text
 You are an expert at detecting **research dataset** citations that appear as repository DOIs in a scientific paper.
 
@@ -56,16 +58,16 @@ For each accepted DOI output: dataset_doi (normalised https://doi.org/... form),
 Output JSON: {"mentions":[{"dataset_doi":"","evidence":"","confidence":0.0}]}
 ```
 
-</details>
+## 2. AccessionExpert
 
-## 2. AccessionExpert (Database Accession Expert)
+*Database Accession Expert*
 
 **Role:** Identify database accession numbers (GEO, SRA, PDB, UniProt, GenBank, etc.)  
 **Strategy:** Extract directly from unambiguous databases; send candidates from higher-risk databases (PDB/GenBank/UniProt) to the LLM for verification.  
 **Output:** `{"mentions":[{"dataset_id":"","evidence":"","confidence":0.0}]}`
 
-<details>
-<summary><strong>AccessionExpert Prompt Template</strong></summary>
+### AccessionExpert Prompt Template
+
 ```text
 You are an expert at detecting database **accession numbers** that denote datasets. You are given candidate IDs whose **format matches but needs context confirmation** (mostly short prefixes like PDB/GenBank/UniProt/Ensembl/Pfam, easily confused with gene names, primers, or figure/table labels). Keep only IDs the paper actually cites/uses as a dataset; drop non-dataset IDs and regex false hits.
 
@@ -112,16 +114,16 @@ For each kept ID output: dataset_id (copy the ID verbatim), evidence (verbatim s
 Output JSON: {"mentions":[{"dataset_id":"","evidence":"","confidence":0.0}]}
 ```
 
-</details>
+## 3. MetadataExpert
 
-## 3. MetadataExpert (Metadata Reverse-Lookup Expert)
+*Metadata Reverse-Lookup Expert*
 
 **Role:** Improve recall through DataCite reverse lookup (overcoming the ceiling of text-only extraction).  
 **Strategy:** Filter candidates according to relationType strength and textual anchors.  
 **Output:** `{"mentions":[{"dataset_doi":"","relation":"","evidence":"","confidence":0.0}]}`
 
-<details>
-<summary><strong>MetadataExpert Prompt Template</strong></summary>
+### MetadataExpert Prompt Template
+
 ```text
 You screen dataset candidates obtained by reverse-lookup from DataCite. The system found DOIs that DataCite marks as resourceType=Dataset and claims are related to this paper (with relationType and publisher). These candidates are NOT all genuine dataset citations — some are merely registered under the same project/author, or only weakly related.
 
@@ -162,16 +164,16 @@ For each kept candidate output: dataset_doi (normalised https://doi.org/... form
 Output JSON: {"mentions":[{"dataset_doi":"","relation":"","evidence":"","confidence":0.0}]}
 ```
 
-</details>
+## 4. Prosecutor
 
-## 4. Prosecutor (Adversarial Debate - Opposing Role)
+*Adversarial Debate — Opposing Role*
 
 **Role:** Argue that the candidate should be SUPPRESSED (classified as a non-dataset).  
 **Strategy:** Seek red-flag evidence, but concede when no clear red flag exists.  
 **Output:** `{"verdict":"SUPPRESS|EMIT","red_flag":"which red flag or none","evidence":"<verbatim snippet>","confidence":0.0}`
 
-<details>
-<summary><strong>Prosecutor Prompt Template</strong></summary>
+### Prosecutor Prompt Template
+
 ```text
 You are the PROSECUTOR. Argue that this candidate should be SUPPRESSED (NOT emitted as a dataset citation). Hunt for a concrete red flag from the list above and quote the verbatim text that shows it. Be adversarial but honest: if the only evidence is that it IS a reused public DB record cited as data, you have no case — say so.
 
@@ -214,16 +216,16 @@ Your output: {"verdict":"EMIT","red_flag":"none","evidence":"This is the study's
 Output JSON: {"verdict":"SUPPRESS|EMIT","red_flag":"which red flag or none","evidence":"<verbatim snippet>","confidence":0.0}
 ```
 
-</details>
+## 5. Defender
 
-## 5. Defender (Adversarial Debate - Supporting Role)
+*Adversarial Debate — Supporting Role*
 
 **Role:** Argue that the candidate should be EMITTED (retained as a valid dataset).  
 **Strategy:** Ground the argument in verbatim evidence and rebut the Prosecutor's red flag.  
 **Output:** `{"verdict":"EMIT|SUPPRESS","rebuttal":"answer to the red flag","evidence":"<verbatim snippet>","confidence":0.0}`
 
-<details>
-<summary><strong>Defender Prompt Template</strong></summary>
+### Defender Prompt Template
+
 ```text
 You are the DEFENDER. Argue that this candidate SHOULD be emitted as a genuine dataset citation. You MUST ground your case in a verbatim snippet copied from the provided text (data-availability statement, deposit/reuse sentence, accession context). If you cannot find real supporting text, concede SUPPRESS — do not invent data-use the text does not show. Rebut the prosecutor's red flag if it is wrong.
 
@@ -285,12 +287,12 @@ Decision process:
 Output JSON: {"decision":"EMIT|SUPPRESS","reason":"<explain which side won and why, referencing their evidence and confidence>","confidence":0.0}
 ```
 
-</details>
+## 6. Judge
 
-## 6. Judge (Final Decision Role)
+*Final Decision Role*
 
-<details>
-<summary><strong>Judge Prompt Template</strong></summary>
+### Judge Prompt Template
+
 ```text
 You are the JUDGE deciding whether to EMIT (keep) or SUPPRESS (drop) a candidate
 dataset citation, given a prosecutor (argues SUPPRESS) and a defender (argues EMIT).
@@ -357,6 +359,4 @@ Decision process:
 
 Output JSON: {"decision":"EMIT|SUPPRESS","reason":"<explain which side won and why, referencing their evidence and confidence>","confidence":0.0}
 ```
-
-</details>
 
