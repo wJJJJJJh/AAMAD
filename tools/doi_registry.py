@@ -1,146 +1,175 @@
-"""DOI 注册表反查（DataCite）：突破纯文本抽取的召回天花板。
+"""Cached DataCite lookup with exact endpoints and preserved relation direction.
 
-两个能力：
-  - related_datasets(article_id)：以论文 DOI 反查 DataCite，取 relatedIdentifiers 里
-    resourceType=Dataset 的关联 DOI（很多数据集「登记过但不在正文」，只能靠元数据拿到）；
-  - search_by_name(name)：按数据集名称/accession 在 DataCite 全文检索候选 DOI，供
-    名称→DOI 消歧。
-
-工程约束：
-  - 结果按 query 落盘缓存到 CACHE_DIR/datacite/，相同查询不重复打网络；
-  - LLM_OFFLINE=1 时缓存未命中直接返回空（绝不打网络），供审稿人离线复现；
-  - 任何网络异常都吞掉并返回空列表——注册表是「增召回」的可选增强，不能因外部服务
-    抖动而让主流程失败。
+A reverse-search hit is usable only if relatedIdentifiers names this article.
+Forward and reverse links are both collected; failed HTTP requests are not cached
+as successful empty results.
 """
 from __future__ import annotations
-
 import hashlib
 import json
-import re
-from pathlib import Path
-
+import logging
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 import config
+from tools.candidates import article_key, normalize_doi
 
-_DATACITE_API = "https://api.datacite.org/dois"
-_TIMEOUT = 20
+_API = "https://api.datacite.org/dois"
+log = logging.getLogger(__name__)
 
+def _cache_path(key: str):
+    return config.CACHE_DIR / "datacite" / (hashlib.sha256(("v2:" + key).encode()).hexdigest() + ".json")
 
-def _cache_get(key: str) -> list[dict] | None:
-    d = config.CACHE_DIR / "datacite"
-    d.mkdir(parents=True, exist_ok=True)
-    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
-    f = d / f"{h}.json"
-    if f.exists():
-        try:
-            return json.loads(f.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            return None
-    return None
-
-
-def _cache_put(key: str, value: list[dict]) -> None:
-    d = config.CACHE_DIR / "datacite"
-    d.mkdir(parents=True, exist_ok=True)
-    h = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+def _cache_get(key: str):
+    p = _cache_path(key)
     try:
-        (d / f"{h}.json").write_text(json.dumps(value, ensure_ascii=False),
-                                     encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _get_json(url: str, params: dict) -> dict | None:
-    """带超时的 GET；离线模式或任何异常返回 None（调用方据此回退空结果）。"""
-    if config.LLM_OFFLINE:
-        return None
-    try:
-        import requests
-        r = requests.get(url, params=params, timeout=_TIMEOUT,
-                         headers={"User-Agent": "dataset-matching-research/1.0"})
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:  # noqa: BLE001
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except (OSError, ValueError):
         return None
 
+def _cache_put(key: str, value) -> None:
+    p = _cache_path(key)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+
+def _get_json(url: str, params: dict | None = None) -> dict | None:
+    if config.LLM_OFFLINE or not config.DATACITE_ENABLED:
+        return None
+    try:
+        if params:
+            url += ("&" if "?" in url else "?") + urlencode(params)
+        request = Request(url, headers={"User-Agent": "AAMAD-research/1.0", "Accept": "application/json"})
+        with urlopen(request, timeout=config.DATACITE_TIMEOUT) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        if exc.code == 404:
+            return {}
+        log.warning("DataCite lookup unavailable (HTTP %s)", exc.code)
+        return None
+    except (URLError, TimeoutError, ValueError, OSError) as exc:
+        log.warning("DataCite lookup unavailable (%s)", type(exc).__name__)
+        return None
+
+def _get_record(doi: str) -> dict:
+    norm = normalize_doi(doi)
+    if not norm:
+        return {}
+    key = "doi:" + norm
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    response = _get_json(_API + "/" + quote(norm.removeprefix("https://doi.org/"), safe="/"))
+    if response is None:
+        return {}
+    attrs = (response.get("data") or {}).get("attributes") or {}
+    _cache_put(key, attrs)
+    return attrs
+
+def _brief(attrs: dict, doi: str) -> dict:
+    return {
+        "doi": normalize_doi(doi),
+        "title": "\n".join(str(t.get("title", "")) for t in attrs.get("titles", [])),
+        "description": "\n".join(str(d.get("description", "")) for d in attrs.get("descriptions", [])),
+        "publisher": attrs.get("publisher", ""),
+        "resourceTypeGeneral": (attrs.get("types") or {}).get("resourceTypeGeneral", ""),
+        "creators": attrs.get("creators", []),
+        "relations": [],
+    }
+
+def dataset_metadata(doi: str) -> dict:
+    if not config.DATACITE_ENABLED:
+        return {}
+    attrs = _get_record(doi)
+    return _brief(attrs, doi) if attrs else {}
 
 def related_datasets(article_id: str) -> list[dict]:
-    """反查与本文 DOI 关联、且 resourceType=Dataset 的候选。
-
-    返回 [{doi, relationType, publisher, title}]。缓存命中直接返回；
-    离线且未命中返回 []。"""
-    key = f"related::{article_id}"
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    data = _get_json(f"{_DATACITE_API}/{article_id}", {})
-    out: list[dict] = []
-    if data:
-        attrs = (data.get("data") or {}).get("attributes") or {}
-        for rel in attrs.get("relatedIdentifiers", []) or []:
-            if (rel.get("relatedIdentifierType") == "DOI"
-                    and str(rel.get("resourceTypeGeneral", "")).lower() == "dataset"):
-                doi = rel.get("relatedIdentifier", "")
-                if doi:
-                    out.append({"doi": _norm(doi),
-                                "relationType": rel.get("relationType", ""),
-                                "publisher": "", "title": ""})
-        # 若关联标识没带 resourceType，再补一次「本文 DOI 被哪些 Dataset 关联」检索
-        if not out:
-            out = _query_related_by_search(article_id)
-    _cache_put(key, out)
-    return out
-
-
-def _query_related_by_search(article_id: str) -> list[dict]:
-    data = _get_json(_DATACITE_API, {
-        "query": f'relatedIdentifiers.relatedIdentifier:"{article_id}"',
-        "resource-type-id": "dataset", "page[size]": 40})
-    return _parse_hits(data)
-
-
-def search_by_name(name: str, rows: int = 20) -> list[dict]:
-    """按名称/accession 在 DataCite 检索 Dataset 候选（名称→DOI 消歧用）。
-
-    返回 [{doi, title, publisher, relationType}]。空名/离线未命中返回 []。"""
-    q = (name or "").strip()
-    if not q:
+    if not config.DATACITE_ENABLED:
         return []
-    key = f"search::{q.lower()}"
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    data = _get_json(_DATACITE_API, {
-        "query": q, "resource-type-id": "dataset", "page[size]": rows})
-    out = _parse_hits(data)
-    _cache_put(key, out)
-    return out
+    article = article_key(article_id)
+    if not normalize_doi(article):
+        return []
+    candidates: dict[str, dict] = {}
+    def add(record: dict, relation: dict):
+        key = record["doi"]
+        if not key or key == article:
+            return
+        item = candidates.setdefault(key, record)
+        if relation not in item["relations"]:
+            item["relations"].append(relation)
 
-
-def _parse_hits(data: dict | None) -> list[dict]:
-    out: list[dict] = []
-    if not data:
-        return out
-    for hit in data.get("data", []) or []:
-        attrs = hit.get("attributes") or {}
-        doi = attrs.get("doi") or hit.get("id", "")
+    # Relations registered on the article itself.
+    attrs = _get_record(article)
+    for rel in attrs.get("relatedIdentifiers", []):
+        if str(rel.get("relatedIdentifierType", "")).upper() != "DOI":
+            continue
+        doi = normalize_doi(rel.get("relatedIdentifier", ""))
         if not doi:
             continue
-        titles = attrs.get("titles") or []
-        title = (titles[0].get("title", "") if titles else "")
-        out.append({"doi": _norm(doi), "title": title,
-                    "publisher": attrs.get("publisher", "") or "",
-                    "relationType": ""})
-    return out
+        record = dataset_metadata(doi)
+        resource = record.get("resourceTypeGeneral") or rel.get("resourceTypeGeneral", "")
+        if str(resource).lower() == "dataset":
+            record = record or _brief({}, doi)
+            record["resourceTypeGeneral"] = resource
+            add(record, dict(subject=article, object=doi, relationType=rel.get("relationType", "")))
 
+    # Also reverse-query when an article DOI is registered with Crossref, or
+    # forward links exist. Do not arbitrarily stop after the first 40 records.
+    params = {"query": 'relatedIdentifiers.relatedIdentifier:"' +
+                       article.removeprefix("https://doi.org/") + '"',
+              "resource-type-id": "dataset", "page[size]": 1000}
+    key = "reverse:" + article
+    cached = _cache_get(key)
+    if cached is None:
+        hits = []
+        url = _API
+        successful = True
+        while url:
+            response = _get_json(url, params)
+            if response is None:
+                successful = False
+                break
+            hits.extend(response.get("data") or [])
+            next_url = (response.get("links") or {}).get("next")
+            url = next_url if isinstance(next_url, str) and next_url.startswith(_API + "?") else ""
+            params = None
+        if successful and (not config.LLM_OFFLINE and config.DATACITE_ENABLED):
+            _cache_put(key, hits)
+    else:
+        hits = cached
+    for hit in hits:
+        attributes = hit.get("attributes") or {}
+        if str((attributes.get("types") or {}).get("resourceTypeGeneral", "")).lower() != "dataset":
+            continue
+        doi = normalize_doi(attributes.get("doi") or hit.get("id", ""))
+        record = _brief(attributes, doi)
+        for rel in attributes.get("relatedIdentifiers", []):
+            if (str(rel.get("relatedIdentifierType", "")).upper() == "DOI"
+                    and article_key(rel.get("relatedIdentifier", "")) == article):
+                add(record, dict(subject=doi, object=article, relationType=rel.get("relationType", "")))
+    return list(candidates.values())
 
-def _norm(doi: str) -> str:
-    s = (doi or "").strip()
-    low = s.lower()
-    for pre in ("https://doi.org/", "http://doi.org/", "doi:"):
-        if low.startswith(pre):
-            s = s[len(pre):]
-            break
-    m = re.search(r"10\.\d{3,9}/\S+", s)
-    core = m.group(0).rstrip(".,;)]}") if m else s
-    return "https://doi.org/" + core.lower() if core else ""
+def relation_label(article_id: str, dataset_id: str, relations: list[dict]) -> str | None:
+    """Operational input/output mapping, after binding both endpoints.
+
+    IsSupplementTo (dataset -> article) is treated as a study-output signal.
+    Version, part/whole, shared-author and generic metadata links are undecided.
+    """
+    article, dataset = article_key(article_id), normalize_doi(dataset_id)
+    if not dataset:
+        return None
+    labels = set()
+    dataset_to_article = {
+        "issupplementto": "Primary", "isderivedfrom": "Primary",
+        "iscitedby": "Secondary", "isreferencedby": "Secondary", "issourceof": "Secondary",
+    }
+    article_to_dataset = {
+        "issupplementedby": "Primary", "issourceof": "Primary",
+        "cites": "Secondary", "references": "Secondary", "isderivedfrom": "Secondary",
+    }
+    for relation in relations:
+        endpoints = (article_key(relation.get("subject", "")), article_key(relation.get("object", "")))
+        kind = str(relation.get("relationType", "")).casefold()
+        mapping = dataset_to_article if endpoints == (dataset, article) else article_to_dataset if endpoints == (article, dataset) else {}
+        if kind in mapping:
+            labels.add(mapping[kind])
+    return next(iter(labels)) if len(labels) == 1 else None

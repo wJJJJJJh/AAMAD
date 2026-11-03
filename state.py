@@ -1,44 +1,64 @@
-"""状态类：Blackboard、Mention、Prediction"""
+"""Shared evidence. Discovery outputs are not validation votes."""
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 @dataclass
 class AgentLog:
-    """智能体执行日志"""
     agent: str
     output: Any
     note: str = ""
 
 @dataclass
 class Mention:
-    """候选数据集（发现阶段输出）"""
-    raw: str                    # 原始形式
-    norm: str                   # 归一化形式
-    kind: str                   # 类型（DOI, GEO-series, SRA-study等）
-    evidence: str = ""          # 上下文证据
-    score: float = 0.0          # 初始评分
-    repo_class: str = ""        # dataset_native/mixed/supplementary
-    relation: str = ""          # DataCite关系类型
-    in_das_section: bool = False  # 是否在DAS段落
-    discovered_by: str = ""     # 发现来源
+    raw: str
+    norm: str
+    kind: str
+    evidence: str = ""
+    score: float = 0.0
+    repo_class: str = ""
+    relation: str = ""
+    in_das_section: bool = False
+    discovered_by: str = ""
+    pos: int | None = None
+    contexts: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    relations: list[dict] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+    has_data_ctx: bool = False
+    bulk_risk: bool = False
+
+    @property
+    def dataset_id(self) -> str:
+        return self.norm
+    @property
+    def confidence(self) -> float:
+        return self.score
+    @property
+    def form(self) -> str:
+        return "doi" if self.kind == "DOI" else "accession"
 
 @dataclass
 class Prediction:
-    """最终预测输出"""
     dataset_id: str
-    type: str                   # Primary/Secondary
-    case: str = ""              # 分类路径
-    route: str = ""             # 发现路由
-    confidence: float = 0.0
+    type: str
+    case: str = ""
+    route: str = ""
+    confidence: float | None = None
 
 @dataclass
 class Blackboard:
-    """黑板：共享状态"""
     article_id: str
     split: str = "train"
     fulltext: str = ""
+    context: str = ""
+    authors: tuple[str, ...] = ()
+    article_doi: str = ""
     candidates: list[dict] = field(default_factory=list)
     mentions: list[Mention] = field(default_factory=list)
     predictions: list[Prediction] = field(default_factory=list)
     trace: list[AgentLog] = field(default_factory=list)
+    usage: dict = field(default_factory=dict)
+
+    def prediction_rows(self) -> list[dict]:
+        return [dict(article_id=self.article_id, **asdict(p)) for p in self.predictions]
