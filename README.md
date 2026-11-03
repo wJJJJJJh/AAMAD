@@ -1,9 +1,7 @@
 # AAMAD: Annotation-Aligned Multi-Agent Debate for Scientific Paper-to-Dataset Linking
 
 > [!IMPORTANT]
-> **All six core agent prompts are displayed in full below.**
-> The text is exported directly from the runtime Python classes, so the prompts
-> shown here match those used by the implementation.
+> **Agent prompts are displayed below.**
 
 **Quick navigation:** [Agent prompts](#agent-prompts) ·
 [Method correspondence](#method-correspondence) · [Setup](#setup) ·
@@ -13,7 +11,7 @@
 <!-- BEGIN GENERATED AGENT PROMPTS -->
 ## Agent prompts
 
-The six core AAMAD roles are shown in full below. Each block is the exact
+Agent prompts are shown in full below. Each block is the exact
 runtime `system` message, including shared instructions, exported from the
 linked Python class. These blocks are not abbreviated examples.
 
